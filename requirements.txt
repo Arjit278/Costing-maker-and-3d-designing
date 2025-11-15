@@ -1,0 +1,15 @@
+streamlit
+pandas
+numpy
+Pillow
+requests
+openai==0.28.0
+anthropic
+google-generativeai
+pytesseract
+pdf2image
+pdfplumber
+python-dotenv
+huggingface-hub
+openpyxl
+pillow
