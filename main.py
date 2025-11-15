@@ -364,8 +364,8 @@ with tabs[3]:
     pictator_choices = {
         "HF: FLUX.1-dev (lineart/mech)": "hf:black-forest-labs/FLUX.1-dev",
         "HF: SDXL (2D blueprint)": "hf:stabilityai/stable-diffusion-xl-base-1.0",
-        "OpenRouter: meta-llama/llama-4-scout (text analysis)": "openrouter:meta-llama/llama-4-scout:free",
-        "GPT (OpenRouter GPT-4o-mini text branch)": "gpt-vision"
+        "HF: RealisticVision (3D Render)": "stabilityai/stable-diffusion-3-medium-diffusers",       
+        "OpenRouter: meta-llama/llama-4-scout (text analysis)": "openrouter:meta-llama/llama-4-scout:free"
     }
     model_name = st.selectbox("Select Pictator Engine", list(pictator_choices.keys()))
     engine_choice = pictator_choices[model_name]
