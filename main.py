@@ -1,47 +1,20 @@
-# Harmony Costulator + Pictator Analyzer (v1.5.4) — OpenRouter AI OCR (Gemini primary, Yi-Vision fallback)
-# Only OCR pipeline changed — rest logic preserved as requested.
+# streamlit_app.py
+# Harmony — Costulator + Pictator (Streamlit Cloud ready)
+# OCR & analysis: OpenRouter (primary: 01-ai/yi-vision, fallback: google/gemini-2.5-flash-lite)
+# Image generation: Hugging Face Router (HF_TOKEN from secrets)
 
 import os
 import io
 import base64
+import time
+import json
 import pandas as pd
 import numpy as np
+import requests
 from PIL import Image, ImageEnhance, ImageFilter
 import streamlit as st
-import requests
-import time
 
-# Optional local tesseract support (will not run on Streamlit Cloud).
-try:
-    import pytesseract
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    HAS_TESSERACT = True
-except Exception:
-    HAS_TESSERACT = False
-
-try:
-    from pdf2image import convert_from_path
-except Exception:
-    convert_from_path = None
-
-# ==== Secrets & Keys (Streamlit Secrets preferred) ====
-def get_secret(key, default=None):
-    try:
-        if key in st.secrets:
-            return st.secrets[key]
-    except Exception:
-        pass
-    return default
-
-st.sidebar.header("🔐 API Keys / Overrides (optional for local use)")
-openrouter_key = get_secret("OPENROUTER_KEY", None)
-hf_token = get_secret("HF_TOKEN", None)
-
-# Allow manual overrides in sidebar for local dev
-openrouter_key = st.sidebar.text_input("OpenRouter Key (OPENROUTER_KEY)", openrouter_key, type="password")
-hf_token = st.sidebar.text_input("HuggingFace Token (HF_TOKEN)", hf_token, type="password")
-
-# ==== OpenRouter (OpenAI-compatible) SDK detection ====
+# --- Try to import OpenAI SDK for OpenRouter usage ---
 HAS_OPENAI_SDK = False
 try:
     import openai
@@ -49,427 +22,467 @@ try:
 except Exception:
     HAS_OPENAI_SDK = False
 
-if not HAS_OPENAI_SDK:
-    st.sidebar.warning("Install openai: pip install openai — required for OpenRouter calls.")
+# --- Config / Secrets ---
+st.set_page_config(page_title="Harmony Costulator + Pictator (Streamlit Cloud)", layout="wide")
+st.title("⚡ Harmony Costulator + Pictator Analyzer (Streamlit Cloud)")
 
-# ==== OpenRouter helper for text completions and vision OCR ====
-def call_openrouter_chat(prompt: str, model: str, api_key: str, max_tokens: int = 1024):
-    """
-    General helper to call OpenRouter via openai.ChatCompletion (OpenAI-compatible).
-    Returns text or an error string starting with [❌ ...]
-    """
-    if not api_key:
-        return "[❌ OpenRouter API key missing]"
-    if not HAS_OPENAI_SDK:
-        return "[❌ OpenAI SDK not installed: pip install openai]"
+def get_secret(key):
     try:
-        openai.api_base = "https://openrouter.ai/api/v1"
-        openai.api_key = api_key
-        completion = openai.ChatCompletion.create(
-            model=model,
-            messages=[{"role": "system", "content": "You are an assistant."},
-                      {"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=0.0,
-        )
-        return completion["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"[❌ Model call failed: {str(e)}]"
+        return st.secrets[key]
+    except Exception:
+        return None
 
-def call_openrouter_vision_ocr(pil_image: Image.Image, api_key: str,
-                               primary_model="google/gemini-2.5-flash-lite",
-                               fallback_model="01-ai/yi-vision",
-                               final_fallback="gpt-4o-mini"):
+OPENROUTER_KEY = get_secret("OPENROUTER_KEY")  # required
+HF_TOKEN = get_secret("HF_TOKEN")              # required for pictator image generation
+
+# Also allow sidebar overrides for local dev
+st.sidebar.header("API keys (optional override)")
+openrouter_key_input = st.sidebar.text_input("OpenRouter Key", OPENROUTER_KEY or "", type="password")
+hf_token_input = st.sidebar.text_input("HF_TOKEN", HF_TOKEN or "", type="password")
+
+OPENROUTER_KEY = openrouter_key_input.strip() or OPENROUTER_KEY
+HF_TOKEN = hf_token_input.strip() or HF_TOKEN
+
+if not OPENROUTER_KEY:
+    st.sidebar.error("OPENROUTER_KEY not found in secrets. Add it to App Settings > Secrets.")
+if not HF_TOKEN:
+    st.sidebar.warning("HF_TOKEN not found in secrets. HF image generation will be disabled until set.")
+
+# --- Utility: image enhancement helper for OCR ---
+def enhance_image_for_ocr(pil_img: Image.Image) -> Image.Image:
+    try:
+        img = pil_img.convert("L")
+        img = ImageEnhance.Contrast(img).enhance(1.7)
+        img = ImageEnhance.Sharpness(img).enhance(1.2)
+        img = ImageEnhance.Brightness(img).enhance(1.05)
+        return img
+    except Exception:
+        return pil_img
+
+# --- OpenRouter helper (ChatCompletion-based) ---
+def call_openrouter_chat(model: str, messages, max_tokens=1500, temperature=0.0):
     """
-    Try multi-stage OpenRouter OCR:
-      1) Primary model (Gemini 2.5 flash lite) via OpenRouter ChatCompletion with image base64 in prompt
-      2) Fallback model Yi-Vision via same approach
-      3) final fallback gpt-4o-mini attempt
-      4) Local tesseract if available
-    Returns extracted text (string) or an error message.
+    Uses openai SDK configured to point to openrouter.ai.
+    Returns the assistant text or raises an Exception.
     """
-    # prepare base64 image
-    buf = io.BytesIO()
-    pil_image.save(buf, format="PNG")
-    img_b = buf.getvalue()
-    b64 = base64.b64encode(img_b).decode("utf-8")
-
-    if not api_key:
-        return "[OCR unavailable — OpenRouter key not provided]"
-
     if not HAS_OPENAI_SDK:
-        return "[OCR unavailable — openai SDK not installed]"
+        raise RuntimeError("OpenAI SDK not available. Install `openai` in requirements.")
+    if not OPENROUTER_KEY:
+        raise RuntimeError("OPENROUTER_KEY not provided in secrets or sidebar.")
+    openai.api_key = OPENROUTER_KEY
+    openai.api_base = "https://openrouter.ai/api/v1"
+    completion = openai.ChatCompletion.create(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature
+    )
+    return completion["choices"][0]["message"]["content"]
 
-    # prepare message to ask OCR
-    # Keep it short and explicit: provide base64, ask for plain text only
-    user_msg_template = (
-        "You are an OCR assistant. Extract any readable text, table data, and numeric values "
-        "from the image provided as a base64 data URI. ONLY return the text/table in plain text or CSV format; "
-        "no commentary.\n\nBASE64_IMAGE:data:image/png;base64,{b64}"
-    ).format(b64=b64)
+# --- AI OCR via OpenRouter: primary yi-vision, fallback gemini ---
+def ai_ocr_openrouter(pil_img: Image.Image, want_csv: bool = False):
+    """
+    Returns extracted text or CSV text.
+    Primary: model '01-ai/yi-vision'
+    Fallback: 'google/gemini-2.5-flash-lite'
+    When want_csv=True, instruct the model to output CSV preserving columns when possible.
+    """
+    # enhance
+    img_for_ocr = enhance_image_for_ocr(pil_img)
+    buf = io.BytesIO()
+    img_for_ocr.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    instruction = (
+        "You are an OCR assistant specialized in engineering/cost tables. "
+        "Extract all table data and text from the image provided as base64. "
+        "If the image contains a table, return CSV text only (no commentary) that preserves the original column names and row order. "
+        "If no table, return plain extracted text. "
+        "Always return machine-parseable CSV when a table is detected."
+    )
+    if want_csv:
+        instruction = (
+            "You are an OCR assistant specialized in engineering/cost tables. "
+            "Extract any tabular data and return CSV text only (no commentary). "
+            "Preserve original column headers as closely as possible. "
+            "If you cannot find a table, return a simple CSV with one column 'extracted_text' and the extracted text as a single row."
+        )
+
+    messages = [
+        {"role": "system", "content": "You are an accurate OCR assistant for engineering drawings and cost sheets."},
+        {"role": "user", "content": instruction},
+        {"role": "user", "content": f"IMAGE_BASE64:{b64}"}
+    ]
 
     # Try primary
-    try:
-        openai.api_base = "https://openrouter.ai/api/v1"
-        openai.api_key = api_key
-        resp = openai.ChatCompletion.create(
-            model=primary_model,
-            messages=[{"role":"user","content": user_msg_template}],
-            temperature=0.0,
-            max_tokens=4096
-        )
-        out = resp["choices"][0]["message"]["content"]
-        # If the model returned an explicit error or empty, try fallback
-        if out and not out.strip().startswith("[❌") and len(out.strip())>0:
-            return out
-    except Exception:
-        # fall through to fallback
-        pass
-
-    # Try yi-vision (fallback)
-    try:
-        resp = openai.ChatCompletion.create(
-            model=fallback_model,
-            messages=[{"role":"user","content": user_msg_template}],
-            temperature=0.0,
-            max_tokens=4096
-        )
-        out = resp["choices"][0]["message"]["content"]
-        if out and not out.strip().startswith("[❌") and len(out.strip())>0:
-            return out
-    except Exception:
-        pass
-
-    # Final attempt with gpt-4o-mini general vision-capable fallback
-    try:
-        resp = openai.ChatCompletion.create(
-            model=final_fallback,
-            messages=[{"role":"user","content": user_msg_template}],
-            temperature=0.0,
-            max_tokens=4096
-        )
-        out = resp["choices"][0]["message"]["content"]
-        if out and not out.strip().startswith("[❌") and len(out.strip())>0:
-            return out
-    except Exception:
-        pass
-
-    # Local tesseract fallback
-    if HAS_TESSERACT:
+    for model in ("01-ai/yi-vision", "google/gemini-2.5-flash-lite"):
         try:
-            text = pytesseract.image_to_string(pil_image)
-            return text.strip() or "[No text detected by Tesseract]"
-        except Exception:
-            pass
+            # OpenRouter supports chat completions; some vision models may return a long text with CSV
+            res = call_openrouter_chat(model=model, messages=messages, max_tokens=2500, temperature=0.0)
+            # Heuristic: if looks like CSV (has commas and newlines and at least one header row), return directly.
+            if isinstance(res, str):
+                txt = res.strip()
+                # If model returned a JSON or quoted block, try to strip markdown fences
+                if txt.startswith("```") and txt.endswith("```"):
+                    txt = "\n".join(txt.splitlines()[1:-1])
+                # If it is CSV-like:
+                if ("," in txt and "\n" in txt) or txt.count("\n") >= 1:
+                    return txt
+                # if it returned plain text, return that in CSV wrapper when want_csv
+                if want_csv:
+                    # return as single column CSV
+                    safe_text = txt.replace('"', '""')
+                    return f"extracted_text\n\"{safe_text}\""
+                return txt
+        except Exception as e:
+            # try fallback model
+            continue
 
-    return "[OCR unavailable — all AI OCR attempts failed and Tesseract not installed]"
+    # If both fail
+    raise RuntimeError("AI OCR failed (OpenRouter models). Check key/permissions or model availability.")
 
-# ==== Utilities used previously ====
-def enhance_and_ocr(img: Image.Image) -> str:
+# --- HF Router image generation helper (Pictator) ---
+def hf_router_generate_image(model_repo: str, prompt: str, width=768, height=768, steps=30, guidance=3.5):
     """
-    Image enhancement + attempt local tesseract (if allowed).
-    If you want AI OCR you should call call_openrouter_vision_ocr directly.
+    Calls HF Router endpoint for the specified model repo.
+    Returns PIL.Image on success or raises Exception with message.
     """
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN not set in secrets or sidebar")
+    url = f"https://router.huggingface.co/hf-inference/models/{model_repo}"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "width": int(width),
+            "height": int(height),
+            "num_inference_steps": int(steps),
+            "guidance_scale": float(guidance)
+        }
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    if resp.status_code != 200:
+        # Try to include router message for debugging
+        raise RuntimeError(f"HF Router error {resp.status_code}: {resp.text[:1000]}")
+    ct = resp.headers.get("content-type", "")
+    # If binary image returned:
+    if "image" in ct:
+        return Image.open(io.BytesIO(resp.content)).convert("RGB")
+    # Else try JSON candidates
     try:
-        img_t = img.convert("L")
-        img_t = ImageEnhance.Contrast(img_t).enhance(1.6)
-        img_t = ImageEnhance.Brightness(img_t).enhance(1.1)
-        img_t = img_t.filter(ImageFilter.SHARPEN)
+        data = resp.json()
     except Exception:
-        img_t = img
+        raise RuntimeError(f"HF Router returned non-JSON and not image. Raw: {resp.text[:800]}")
+    # Try multiple JSON shapes
+    if isinstance(data, dict):
+        for key in ("generated_image", "image"):
+            if key in data:
+                img_b = base64.b64decode(data[key])
+                return Image.open(io.BytesIO(img_b)).convert("RGB")
+        if "images" in data and isinstance(data["images"], list) and data["images"]:
+            img_b = base64.b64decode(data["images"][0])
+            return Image.open(io.BytesIO(img_b)).convert("RGB")
+    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+        for key in ("blob", "generated_image", "image"):
+            if key in data[0]:
+                img_b = base64.b64decode(data[0][key])
+                return Image.open(io.BytesIO(img_b)).convert("RGB")
+    raise RuntimeError("HF Router returned unknown image format.")
 
-    if HAS_TESSERACT:
-        try:
-            out = pytesseract.image_to_string(img_t)
-            return out.strip() or "[No text detected by Tesseract]"
-        except Exception:
-            return "[Tesseract OCR failed]"
-    return "[No OCR available (Tesseract not installed)]"
+# --- Tab layout ---
+tab1, tab2, tab3, tab4 = st.tabs(["🧠 Pictator Analyzer", "📊 Costulator (Profitability)", "📈 Costulator Generator", "🎨 Pictator Creator"])
 
-def ocr_pdf(path: str) -> str:
-    try:
-        import pdfplumber
-        text = ""
-        with pdfplumber.open(path) as pdf:
-            for page in pdf.pages:
-                text += page.extract_text() or ""
-        return text.strip() or "[No text found in PDF]"
-    except Exception:
-        if convert_from_path:
-            images = convert_from_path(path)
-            # Use AI OCR on each page if openrouter_key present, else tesseract
-            texts = []
-            for p in images:
-                if openrouter_key:
-                    texts.append(call_openrouter_vision_ocr(p, openrouter_key))
-                else:
-                    texts.append(enhance_and_ocr(p))
-            return "\n".join(texts)
-        return "[PDF OCR unavailable]"
-
-# ==== Pictator image generation helper (kept compatible) ====
-def generate_pictator_image(prompt: str, api_key: str, model_choice: str = "gpt-4o-mini"):
-    """
-    Use OpenRouter ChatCompletion to request an image or base64 blob from a vision model.
-    We attempt to use the OpenRouter chat completion with the provided model_choice (if available).
-    Returns dict with type: "image"/"text"/"error"
-    """
-    if not api_key:
-        return {"type":"error", "data":"[OpenRouter key missing]"}
-    if not HAS_OPENAI_SDK:
-        return {"type":"error", "data":"[openai SDK missing]"}
-
-    try:
-        openai.api_base = "https://openrouter.ai/api/v1"
-        openai.api_key = api_key
-        # We ask the model to return base64 PNG image as data URI if capable
-        user_prompt = (
-            "You are an image generation assistant. Given the prompt below, return only a PNG image "
-            "encoded as a data URI (data:image/png;base64,...) with no additional text if you can generate images. "
-            "If you cannot return images, return a short text explaining how to produce the image.\n\n"
-            f"PROMPT:\n{prompt}"
-        )
-        resp = openai.ChatCompletion.create(
-            model=model_choice,
-            messages=[{"role":"user","content":user_prompt}],
-            temperature=0.2,
-            max_tokens=2000
-        )
-        content = resp["choices"][0]["message"]["content"]
-        if not content:
-            return {"type":"error","data":"[No output from model]"}
-        content = content.strip()
-
-        if content.startswith("data:image"):
-            # decode and return PIL image
-            header, b64 = content.split(",", 1)
-            img_bytes = base64.b64decode(b64)
-            img = Image.open(io.BytesIO(img_bytes))
-            return {"type":"image","data": img}
-        else:
-            # may be URL, or textual instructions
-            return {"type":"text","data":content}
-    except Exception as e:
-        return {"type":"error","data":f"[OpenRouter generation failed: {e}]"}
-
-# ==== Streamlit UI & Tabs (unchanged logic, only OCR calls replaced) ====
-st.set_page_config(page_title="Harmony Costulator + Pictator Analyzer", layout="wide")
-st.title("⚡ Harmony Costulator + Pictator Analyzer (v1.5.4)")
-
-st.sidebar.info("Store OPENROUTER_KEY, HF_TOKEN in Streamlit Secrets, or paste them here for local testing.")
-st.sidebar.write("OpenRouter key present:", bool(openrouter_key))
-st.sidebar.write("HF token present:", bool(hf_token))
-
-api_key = openrouter_key  # used for OpenRouter model calls in this app
-if not api_key:
-    st.warning("OpenRouter API key not provided — OpenRouter-dependent features will not work.")
-
-tabs = st.tabs(["🧠 Pictator Analyzer", "📊 Costulator (Profitability)", "📈 Costulator Generator", "🎨 Pictator Creator"])
-
-# === TAB 1: Pictator Analyzer ===
-with tabs[0]:
-    st.subheader("Upload Drawing / Design Image or PDF")
-    file = st.file_uploader("Upload an image or PDF", type=["jpg", "jpeg", "png", "pdf"])
-    custom_prompt = st.text_area(
-        "Custom Prompt (editable)",
-        "Analyze this engineering drawing for materials, machining process, tooling setup, optimization, and improvements."
-    )
-    enable_ai_ocr = st.checkbox("Enable AI OCR mode (OpenRouter - Gemini primary, Yi-Vision fallback)", True)
+# -----------------------------
+# Tab1: Pictator Analyzer (image upload + OCR + analysis)
+# -----------------------------
+with tab1:
+    st.header("🧠 Pictator Analyzer")
+    st.write("Upload a drawing (image/pdf). AI OCR (01-ai/yi-vision primary, gemini fallback) extracts text/tables. OpenRouter LLM analyzes the drawing.")
+    file = st.file_uploader("Upload drawing (jpg/png/pdf)", type=["jpg", "jpeg", "png", "pdf"])
+    custom_prompt = st.text_area("Analysis prompt (optional)", "Analyze this engineering drawing: materials, machining steps, tooling, tolerances, optimizations.")
+    enable_ai_ocr = st.checkbox("Enable AI OCR mode (uses OpenRouter)", True)
 
     if file:
         ext = file.name.split(".")[-1].lower()
         if ext == "pdf":
-            tmp = f"temp_{file.name}"
-            with open(tmp, "wb") as f:
-                f.write(file.read())
-            with st.spinner("Extracting text from PDF..."):
-                extracted_text = ocr_pdf(tmp)
+            # simple PDF -> images extraction fallback using pdf2image if present
+            try:
+                from pdf2image import convert_from_bytes
+                pages = convert_from_bytes(file.read())
+                st.image(pages[0], caption="First page preview", use_column_width=True)
+                img_for_ocr = pages[0]
+            except Exception:
+                st.error("PDF processing unavailable in this environment.")
+                img_for_ocr = None
         else:
-            img = Image.open(file).convert("RGB")
-            st.image(img, caption="Uploaded Drawing", use_container_width=True)
-            with st.spinner("Performing OCR on image..."):
-                if enable_ai_ocr and api_key:
-                    extracted_text = call_openrouter_vision_ocr(img, api_key,
-                                                               primary_model="google/gemini-2.5-flash-lite",
-                                                               fallback_model="01-ai/yi-vision",
-                                                               final_fallback="gpt-4o-mini")
-                else:
-                    extracted_text = enhance_and_ocr(img)
+            img_for_ocr = Image.open(file).convert("RGB")
+            st.image(img_for_ocr, caption="Uploaded image", use_column_width=True)
 
-        st.text_area("📜 Extracted Text", extracted_text, height=180)
+        if enable_ai_ocr and img_for_ocr is not None:
+            with st.spinner("Running AI OCR (OpenRouter) to extract text/table..."):
+                try:
+                    ocr_csv_text = ai_ocr_openrouter(img_for_ocr, want_csv=True)
+                    st.success("AI OCR completed.")
+                    st.download_button("Download OCR CSV", data=ocr_csv_text, file_name="ocr_extracted.csv", mime="text/csv")
+                    st.text_area("OCR (CSV or extracted text)", ocr_csv_text, height=200)
+                except Exception as e:
+                    st.error(f"AI OCR failed: {e}")
+                    ocr_csv_text = None
 
-        if st.button("🔍 Run Pictator Analysis"):
-            st.info("Running Pictator Analyzer...")
-            summary = call_openrouter_chat(f"Summarize this drawing:\n\n{extracted_text}", "meta-llama/llama-4-scout:free", api_key)
-            st.markdown("### 📘 Drawing Summary")
-            st.write(summary)
+        else:
+            ocr_csv_text = None
 
-            analysis = call_openrouter_chat(f"{custom_prompt}\n\nDrawing text:\n{extracted_text}", "meta-llama/llama-3.3-70b-instruct:free", api_key)
-            st.subheader("🧩 Pictator AI Engineering Insights")
-            st.write(analysis)
-            st.download_button("⬇️ Download Pictator Analysis", data=analysis, file_name="pictator_analysis.txt")
+        if st.button("🔍 Run drawing analysis (OpenRouter)"):
+            # Use extracted text (prefer CSV) or image -> ask LLM to analyze
+            analysis_input = ""
+            if ocr_csv_text:
+                analysis_input = ocr_csv_text
+            elif img_for_ocr is not None:
+                # send short prompt asking to summarize visually
+                analysis_input = "Image uploaded. Please analyze visually: " + custom_prompt
+            else:
+                st.error("No usable input for analysis.")
+                analysis_input = None
 
-# === TAB 2: Costulator (Profitability) ===
-with tabs[1]:
-    st.subheader("Upload Costing Sheet or Report (CSV preferred)")
-    cost_file = st.file_uploader("Upload costing image, CSV, or PDF", type=["csv", "jpg", "jpeg", "png", "pdf"])
-    cost_prompt = st.text_area(
-        "Custom Prompt",
-        "Analyze this costing sheet for profitability and generate a 3–9 month cost optimization plan."
-    )
-    enable_ai_ocr2 = st.checkbox("Enable AI OCR mode for cost images (OpenRouter)", True)
+            if analysis_input:
+                with st.spinner("Calling OpenRouter LLM for analysis..."):
+                    try:
+                        summary = call_openrouter_chat(
+                            model="meta-llama/llama-4-scout:free",
+                            messages=[
+                                {"role": "system", "content": "You are an engineering assistant."},
+                                {"role": "user", "content": f"Analyze this drawing or data and summarize: \n\n{analysis_input}\n\nReturn a concise technical summary with suggestions for machining, materials, and optimizations."}
+                            ],
+                            max_tokens=800,
+                            temperature=0.2
+                        )
+                        st.subheader("📘 Drawing Summary")
+                        st.write(summary)
+                        # Analysis (detailed)
+                        analysis = call_openrouter_chat(
+                            model="meta-llama/llama-3.3-70b-instruct:free",
+                            messages=[
+                                {"role": "system", "content": "You are an engineering & manufacturing analyst."},
+                                {"role": "user", "content": f"{custom_prompt}\n\nInput data:\n{analysis_input}"}
+                            ],
+                            max_tokens=1200,
+                            temperature=0.2
+                        )
+                        st.subheader("🧩 Detailed Analysis")
+                        st.write(analysis)
+                        st.download_button("Download Pictator Analysis", data=analysis, file_name="pictator_analysis.txt", mime="text/plain")
+                    except Exception as e:
+                        st.error(f"OpenRouter LLM call failed: {e}")
+
+# -----------------------------
+# Tab2: Costulator (Profitability)
+# -----------------------------
+with tab2:
+    st.header("📊 Costulator (Profitability)")
+    st.write("Upload CSV / image / PDF costing sheet. If image/PDF, AI OCR will extract table as CSV using OpenRouter vision models (01-ai/yi-vision → google/gemini-2.5-flash-lite fallback).")
+
+    cost_file = st.file_uploader("Upload costing file (CSV / image / PDF)", type=["csv", "jpg", "jpeg", "png", "pdf"])
+    cost_custom_prompt = st.text_area("Cost analysis prompt (optional)",
+                                     "Analyze the cost sheet and propose optimizations and a 3–9 month cost reduction plan. Return a revised CSV that preserves original columns and adds cost_0_3m, cost_3_6m, cost_6_9m, cost_9_12m.")
 
     if cost_file:
         ext = cost_file.name.split(".")[-1].lower()
+        extracted_text_or_csv = None
+        parsed_df = None
+
         if ext == "csv":
-            df = pd.read_csv(cost_file)
-            st.dataframe(df)
-            text_data = df.to_string(index=False)
-        elif ext == "pdf":
-            tmp = f"temp_{cost_file.name}"
-            with open(tmp, "wb") as f:
-                f.write(cost_file.read())
-            text_data = ocr_pdf(tmp)
-            df = None
+            try:
+                parsed_df = pd.read_csv(cost_file)
+                extracted_text_or_csv = parsed_df.to_csv(index=False)
+                st.success("CSV uploaded and parsed.")
+                st.dataframe(parsed_df)
+            except Exception as e:
+                st.error(f"CSV parse error: {e}")
         else:
-            img = Image.open(cost_file).convert("RGB")
-            st.image(img, caption="Uploaded Costing Image", use_column_width=True)
-            if enable_ai_ocr2 and api_key:
-                text_data = call_openrouter_vision_ocr(img, api_key,
-                                                      primary_model="google/gemini-2.5-flash-lite",
-                                                      fallback_model="01-ai/yi-vision",
-                                                      final_fallback="gpt-4o-mini")
-            else:
-                text_data = enhance_and_ocr(img)
-            df = None
-
-        st.text_area("🧾 Extracted Cost Data / Table", text_data, height=200)
-
-        if st.button("💰 Run Costulator Analysis"):
-            st.info("Running Costulator Analysis...")
-            summary = call_openrouter_chat(f"Summarize costing:\n{text_data}", "deepseek/deepseek-r1-distill-llama-70b:free", api_key)
-            st.markdown("### 📊 Cost Summary")
-            st.write(summary)
-
-            analysis_prompt = f"""
-You are given this cost data or description (CSV or text):
-{text_data}
-
-Produce a CSV table preserving original columns and adding these columns:
-- cost_0_3m
-- cost_3_6m
-- cost_6_9m
-- cost_9_12m
-
-Each new column should be numeric estimates of costs after savings/optimizations.
-Return only CSV text without extra commentary.
-"""
-            revised_csv = call_openrouter_chat(analysis_prompt, "mistralai/mistral-7b-instruct:free", api_key)
-
-            if revised_csv and revised_csv.startswith("[❌"):
-                st.error(revised_csv)
-            else:
+            # Image or PDF -> AI OCR to CSV
+            with st.spinner("Running AI OCR to extract table as CSV..."):
                 try:
-                    new_df = pd.read_csv(io.StringIO(revised_csv))
-                    st.subheader("✅ Revised Cost Table (AI-generated projections)")
-                    st.dataframe(new_df)
-
-                    st.session_state["revised_csv_text"] = revised_csv
-                    st.session_state["revised_df"] = new_df
-
-                    st.download_button("Download Revised CSV", data=revised_csv, file_name="revised_costs_full.csv", mime="text/csv")
+                    if ext == "pdf":
+                        from pdf2image import convert_from_bytes
+                        pages = convert_from_bytes(cost_file.read())
+                        img0 = pages[0]
+                    else:
+                        img0 = Image.open(cost_file).convert("RGB")
+                    ocr_csv_text = ai_ocr_openrouter(img0, want_csv=True)
+                    extracted_text_or_csv = ocr_csv_text
+                    st.success("AI OCR extracted CSV/text.")
+                    st.download_button("Download OCR CSV", data=ocr_csv_text, file_name="ocr_costs.csv", mime="text/csv")
+                    # Try parse to dataframe
+                    try:
+                        parsed_df = pd.read_csv(io.StringIO(ocr_csv_text))
+                        st.dataframe(parsed_df)
+                    except Exception as e:
+                        st.warning(f"Could not parse OCR CSV into table: {e}\nShowing raw OCR output below.")
+                        st.text_area("OCR raw output", ocr_csv_text, height=200)
                 except Exception as e:
-                    st.error(f"Could not parse revised CSV from model. Raw output shown below. Error: {e}")
-                    st.code(revised_csv or "No output from model")
+                    st.error(f"AI OCR failed: {e}")
 
-# === TAB 3: Costulator Generator (Auto Forecast & Excel Snapshots) ===
-with tabs[2]:
-    st.subheader("📈 Generate Forecasted Cost Sheets & Comparison")
-    st.write("This will produce 6-month and 9-month Excel snapshots and a comparison table of percentage savings.")
+        # If parsed_df exists, we can analyze and create revised CSV via LLM
+        if parsed_df is not None and st.button("💰 Run Costulator Analysis"):
+            with st.spinner("Calling OpenRouter LLM to summarize and produce revised CSV..."):
+                # 1) summary
+                try:
+                    summary = call_openrouter_chat(
+                        model="deepseek/deepseek-r1-distill-llama-70b:free",
+                        messages=[
+                            {"role": "system", "content": "You are a cost analyst."},
+                            {"role": "user", "content": f"Summarize this cost table and propose optimizations. Table CSV:\n\n{parsed_df.to_csv(index=False)}"}
+                        ],
+                        max_tokens=800
+                    )
+                    st.subheader("📊 Cost Summary")
+                    st.write(summary)
+                except Exception as e:
+                    st.error(f"Summary model call failed: {e}")
+                    summary = ""
+
+                # 2) ask LLM to return revised CSV with 4 new columns
+                analysis_prompt = f"""
+You are given the following CSV (preserve headers and columns exactly). Produce a CSV only (no commentary) that:
+
+- Preserves the original columns and order.
+- Adds these new numeric columns: cost_0_3m, cost_3_6m, cost_6_9m, cost_9_12m.
+- Each new column should be numeric estimates of the costs after optimization/savings.
+- Provide reasonable, explained numbers implied by the analysis. Keep row count identical.
+
+Original CSV:
+{parsed_df.to_csv(index=False)}
+
+Return ONLY the CSV text (no explanation).
+"""
+                try:
+                    revised_csv_text = call_openrouter_chat(
+                        model="mistralai/mistral-7b-instruct:free",
+                        messages=[
+                            {"role": "system", "content": "You are an accurate CSV transformer and financial forecaster."},
+                            {"role": "user", "content": analysis_prompt}
+                        ],
+                        max_tokens=1800,
+                        temperature=0.2
+                    )
+                except Exception as e:
+                    st.error(f"Revised CSV generation failed: {e}")
+                    revised_csv_text = None
+
+                if revised_csv_text:
+                    # Try parse revised CSV
+                    try:
+                        revised_df = pd.read_csv(io.StringIO(revised_csv_text))
+                        st.subheader("✅ Revised Cost Table (AI-generated)")
+                        st.dataframe(revised_df)
+                        # store in session_state for Tab3
+                        st.session_state["revised_csv_text"] = revised_csv_text
+                        st.session_state["revised_df"] = revised_df
+                        st.download_button("Download Revised CSV", data=revised_csv_text, file_name="revised_costs_full.csv", mime="text/csv")
+                    except Exception as e:
+                        st.error(f"Could not parse revised CSV returned by model: {e}")
+                        st.code(revised_csv_text[:2000])
+
+# -----------------------------
+# Tab3: Costulator Generator (6m/9m snapshots & Excel)
+# -----------------------------
+with tab3:
+    st.header("📈 Costulator Generator — 6 & 9 month snapshots")
+    st.write("This uses the revised CSV created in Tab 2. It will create two Excel files: 6-month and 9-month snapshots plus a comparison table (percentage savings).")
+
     if "revised_df" not in st.session_state:
-        st.info("Please run Tab 2 Costulator Analysis first to generate revised cost table.")
+        st.info("Please run Tab 2 and generate the revised CSV first.")
     else:
-        base_df = st.session_state["revised_df"]
+        base_df = st.session_state["revised_df"].copy()
+        st.subheader("Source Revised Table")
+        st.dataframe(base_df)
 
-        try:
-            for c in ["cost_0_3m", "cost_3_6m", "cost_6_9m", "cost_9_12m"]:
-                if c not in base_df.columns:
-                    st.error(f"Required column {c} not found in revised table.")
-                    raise KeyError
-
-            snapshot_6m = base_df.copy()
-            snapshot_6m["cost_6m_total"] = snapshot_6m["cost_0_3m"].astype(float) + snapshot_6m["cost_3_6m"].astype(float)
-
-            snapshot_9m = base_df.copy()
-            snapshot_9m["cost_9m_total"] = snapshot_9m["cost_0_3m"].astype(float) + snapshot_9m["cost_3_6m"].astype(float) + snapshot_9m["cost_6_9m"].astype(float)
-
-            numeric_cols = [c for c in base_df.columns if pd.api.types.is_numeric_dtype(base_df[c]) or c.lower().startswith("cost")]
-            baseline_col = "cost" if "cost" in base_df.columns else (numeric_cols[0] if numeric_cols else None)
-
-            comp_table = pd.DataFrame()
-            comp_table["item"] = base_df.index.astype(str)
-            if baseline_col:
-                comp_table["baseline_total"] = base_df[baseline_col].astype(float)
-                comp_table["6m_total"] = snapshot_6m["cost_6m_total"]
-                comp_table["9m_total"] = snapshot_9m["cost_9m_total"]
-                comp_table["pct_savings_6m"] = 100.0 * (comp_table["baseline_total"] - comp_table["6m_total"]) / (comp_table["baseline_total"].replace(0, np.nan))
-                comp_table["pct_savings_9m"] = 100.0 * (comp_table["baseline_total"] - comp_table["9m_total"]) / (comp_table["baseline_total"].replace(0, np.nan))
-            else:
-                comp_table["6m_total"] = snapshot_6m["cost_6m_total"]
-                comp_table["9m_total"] = snapshot_9m["cost_9m_total"]
-
-            st.subheader("📊 Comparison Table (percentage savings)")
-            st.dataframe(comp_table.fillna("N/A"))
-
-            towrite_6 = io.BytesIO()
-            towrite_9 = io.BytesIO()
-            with pd.ExcelWriter(towrite_6, engine="xlsxwriter") as writer:
-                snapshot_6m.to_excel(writer, sheet_name="6_month_snapshot", index=False)
-                comp_table.to_excel(writer, sheet_name="comparison", index=False)
-            towrite_6.seek(0)
-
-            with pd.ExcelWriter(towrite_9, engine="xlsxwriter") as writer:
-                snapshot_9m.to_excel(writer, sheet_name="9_month_snapshot", index=False)
-                comp_table.to_excel(writer, sheet_name="comparison", index=False)
-            towrite_9.seek(0)
-
-            st.download_button("Download 6-month Excel", data=towrite_6.getvalue(), file_name="costs_6_months.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            st.download_button("Download 9-month Excel", data=towrite_9.getvalue(), file_name="costs_9_months.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-        except Exception as e:
-            st.error(f"Could not build snapshots: {e}")
-
-# === TAB 4: Pictator Creator (keeps functionality but uses OpenRouter for generation) ===
-with tabs[3]:
-    st.subheader("Create Engineering Drawing from Text")
-    # If you want to use specific HF models for pictator-generator, you can call HF Router separately.
-    # Here we'll offer OpenRouter options (GPT vision) and a note to use HF models via the HF token elsewhere.
-    model_map = {
-        "Pictator-OpenRouter (gpt-4o-mini vision)": "gpt-4o-mini"
-    }
-    model_name = st.selectbox("Select Pictator Engine", list(model_map.keys()))
-    model_choice = model_map[model_name]
-
-    drawing_prompt = st.text_area(
-        "Drawing Prompt (editable)",
-        "Create a detailed mechanical engineering drawing of a CNC component showing diameter, hole distances, tolerances, finishing, labels, and scaling specifications."
-    )
-    if st.button("🎨 Generate Pictator Drawing"):
-        with st.spinner(f"Generating drawing using {model_name}..."):
-            result = generate_pictator_image(drawing_prompt, api_key, model_choice)
-
-        if result["type"] == "image":
-            st.image(result["data"], caption=f"Generated by {model_name}", use_container_width=True)
-            buf = io.BytesIO()
-            result["data"].save(buf, format="PNG")
-            st.session_state["pictator_image"] = buf.getvalue()
-            st.download_button("⬇️ Download Drawing (PNG)", data=st.session_state["pictator_image"], file_name="pictator_generated.png", mime="image/png")
-        elif result["type"] == "text":
-            st.write(result["data"])
-        elif result["type"] == "error":
-            st.error(result["data"])
+        # Validate required new columns
+        required_cols = ["cost_0_3m", "cost_3_6m", "cost_6_9m", "cost_9_12m"]
+        missing = [c for c in required_cols if c not in base_df.columns]
+        if missing:
+            st.error(f"Revised table missing required columns: {missing}")
         else:
-            st.warning("No usable output returned.")
+            try:
+                # create snapshot totals
+                base_df["cost_6m_total"] = base_df["cost_0_3m"].astype(float) + base_df["cost_3_6m"].astype(float)
+                base_df["cost_9m_total"] = base_df["cost_0_3m"].astype(float) + base_df["cost_3_6m"].astype(float) + base_df["cost_6_9m"].astype(float)
+
+                # Determine baseline column to compare — prefer 'cost' or first numeric
+                baseline_col = None
+                if "cost" in base_df.columns:
+                    baseline_col = "cost"
+                else:
+                    numeric_cols = [c for c in base_df.columns if np.issubdtype(base_df[c].dtype, np.number)]
+                    baseline_col = numeric_cols[0] if numeric_cols else None
+
+                comp_table = pd.DataFrame()
+                comp_table["row_id"] = base_df.index.astype(str)
+                if baseline_col:
+                    comp_table["baseline_total"] = base_df[baseline_col].astype(float)
+                    comp_table["6m_total"] = base_df["cost_6m_total"]
+                    comp_table["9m_total"] = base_df["cost_9m_total"]
+                    comp_table["pct_savings_6m"] = 100.0 * (comp_table["baseline_total"] - comp_table["6m_total"]) / comp_table["baseline_total"].replace(0, np.nan)
+                    comp_table["pct_savings_9m"] = 100.0 * (comp_table["baseline_total"] - comp_table["9m_total"]) / comp_table["baseline_total"].replace(0, np.nan)
+                else:
+                    comp_table["6m_total"] = base_df["cost_6m_total"]
+                    comp_table["9m_total"] = base_df["cost_9m_total"]
+
+                st.subheader("Comparison Table (percentage savings)")
+                st.dataframe(comp_table.fillna("N/A"))
+
+                # Build Excel files
+                towrite_6 = io.BytesIO()
+                towrite_9 = io.BytesIO()
+                with pd.ExcelWriter(towrite_6, engine="xlsxwriter") as writer:
+                    # Save 6-month snapshot sheet plus comparison
+                    base_df.to_excel(writer, sheet_name="revised_table", index=False)
+                    comp_table.to_excel(writer, sheet_name="comparison", index=False)
+                with pd.ExcelWriter(towrite_9, engine="xlsxwriter") as writer:
+                    base_df.to_excel(writer, sheet_name="revised_table", index=False)
+                    comp_table.to_excel(writer, sheet_name="comparison", index=False)
+                towrite_6.seek(0); towrite_9.seek(0)
+
+                st.download_button("Download 6-month Excel", data=towrite_6.getvalue(), file_name="costs_6_months.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.download_button("Download 9-month Excel", data=towrite_9.getvalue(), file_name="costs_9_months.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            except Exception as e:
+                st.error(f"Could not produce snapshots: {e}")
+
+# -----------------------------
+# Tab4: Pictator Creator (HF image generation)
+# -----------------------------
+with tab4:
+    st.header("🎨 Pictator Creator")
+    st.write("Use HF Router models to generate engineering drawings (lineart / 3D renders). HF token is read from secrets.")
+
+    MODELS = {
+        "Sketchers (Lineart / Mechanical) - FLUX": "black-forest-labs/FLUX.1-dev",
+        "CAD Drawing XL (2D CNC Blueprints) - SDXL": "stabilityai/stable-diffusion-xl-base-1.0",
+        "RealisticVision (3D Render) - SD3": "stabilityai/stable-diffusion-3-medium"
+    }
+
+    model_choice = st.selectbox("Choose HF model", list(MODELS.keys()))
+    prompt = st.text_area("Drawing prompt:", "technical CNC blueprint lineart of disc brake, top view, thin black lines, engineering drawing")
+    col1, col2 = st.columns(2)
+    with col1:
+        w = st.number_input("Width", 256, 1536, 768)
+    with col2:
+        h = st.number_input("Height", 256, 1536, 768)
+    steps = st.slider("Inference steps", 10, 50, 30)
+    guidance = st.slider("Guidance scale", 1.0, 10.0, 3.5)
+
+    if st.button("Generate Pictator Image"):
+        model_repo = MODELS[model_choice]
+        with st.spinner("Calling HF Router..."):
+            try:
+                img = hf_router_generate_image(model_repo, prompt, width=w, height=h, steps=steps, guidance=guidance)
+                st.image(img, caption="Generated image", use_column_width=True)
+                bio = io.BytesIO()
+                img.save(bio, format="PNG")
+                bio.seek(0)
+                st.download_button("Download PNG", data=bio.getvalue(), file_name="pictator_output.png", mime="image/png")
+            except Exception as e:
+                st.error(f"HF image generation failed: {e}")
 
 st.markdown("---")
-st.caption("© 2025 Harmony Strategy Partner — Costulator + Pictator Suite (AI OCR enabled)")
+st.caption("© 2025 Harmony Strategy Partner — Costulator + Pictator Suite (OpenRouter + HF Router)")
