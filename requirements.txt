@@ -12,4 +12,4 @@ pdfplumber
 python-dotenv
 huggingface-hub
 openpyxl
-pillow
+xlsxwriter>=3.0
