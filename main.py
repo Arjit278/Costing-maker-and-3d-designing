@@ -458,7 +458,7 @@ with tab4:
     MODELS = {
         "Sketchers (Lineart / Mechanical) - FLUX": "black-forest-labs/FLUX.1-dev",
         "CAD Drawing XL (2D CNC Blueprints) - SDXL": "stabilityai/stable-diffusion-xl-base-1.0",
-        "RealisticVision (3D Render) - SD3": "stabilityai/stable-diffusion-3-medium"
+        "RealisticVision (3D Render) - SD3": "stabilityai/stable-diffusion-3-medium-diffusers"
     }
 
     model_choice = st.selectbox("Choose HF model", list(MODELS.keys()))
